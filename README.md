@@ -29,6 +29,14 @@
 绑定；驳回后不能再批准，并发复核只允许一份定稿，同申请同操作重试返回原结果。
 面向监管与内审，还可按设备**审计过去半开区间内的校准覆盖**：按时间顺序还原
 完整、无重叠的合规与空窗片段，合规片段列出当时可用的合格普通证书编号。
+实验室还可按**标准证书控制每日校准使用量**：管理员凭管理密钥为“证书编号 ×
+UTC 日期”设定非负上限，成功时返回上限与实时已用次数（当日已签发数超过新
+上限则拒绝调整，撤销或失效不退还已用次数）；普通证书按 `calibrated_at` 的
+UTC 日期及**直接引用**的上游证书在真正签发时计一次，未配置上限的键沿用原
+签发规则；单张签发、交接批次（批内多张相同键合并计数）与双人复核批准均在
+同一事务原子扣额，超限拒绝本次签发并指出上游证书与日期，批次整批不落库、
+复核申请保持待审；并发调整与签发按提交次序串行绝不超额，既有批次幂等重放
+只返回首次结果、不重复计数。
 
 - 技术栈：Python 3.11 · FastAPI · PostgreSQL 16 · psycopg3
 - 关键业务不变量由**数据库约束 + 触发器 + 单事务**保证，不依赖应用层“先查后写”，
@@ -48,7 +56,7 @@
 │   ├── db.py            # 连接池
 │   ├── config.py        # 环境变量配置
 │   └── errors.py        # 统一业务错误
-├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、批次/更正/交付归档/签收/停用/复核申请/撤销风险告知表）
+├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、批次/更正/交付归档/签收/停用/复核申请/撤销风险告知/每日用量上限表）
 ├── scripts/             # 冒烟测试脚本（可直接对运行中的服务执行）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -103,7 +111,7 @@ docker compose down -v       # 停止并删除数据卷（下次启动重新初�
 | `POSTGRES_DB` | `caltrace` | 数据库名 |
 | `POSTGRES_PORT` | `127.0.0.1:5432` | 数据库在宿主机的绑定地址:端口 |
 | `DB_HOST` / `DB_PORT` | `db` / `5432` | API 容器内连接数据库用（compose 已固定） |
-| `DELIVERY_MANAGEMENT_KEY` | `caltrace-delivery-admin` | 管理密钥：创建签收邀请、查询定稿记录，以及标准证书临时停用的登记/解除/查询均经 `X-Management-Key` 头校验；默认值仅供本机开发，生产必须覆盖为随机长密钥 |
+| `DELIVERY_MANAGEMENT_KEY` | `caltrace-delivery-admin` | 管理密钥：创建签收邀请、查询定稿记录，标准证书临时停用的登记/解除/查询，以及标准证书每日校准使用量上限的设定/调整/查询，均经 `X-Management-Key` 头校验；默认值仅供本机开发，生产必须覆盖为随机长密钥 |
 | `CERTIFICATE_ENTRY_KEYS` | `entry-1=caltrace-entry-key` | 普通证书双人复核的**录入人凭据表**：逗号分隔，每项 `身份名=凭据`；提交申请经 `X-Entry-Key` 头校验。仅本地配置，默认值仅供本机开发 |
 | `CERTIFICATE_REVIEWER_KEYS` | `reviewer-1=caltrace-review-key-1,reviewer-2=caltrace-review-key-2` | 普通证书双人复核的**复核人凭据表**：格式同上；驳回/批准经 `X-Reviewer-Key` 头校验。复核凭据必须与该申请的录入凭据不同（同凭据复核 `403`）；默认值仅供本机开发 |
 
@@ -326,6 +334,60 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
     - **只增不改**：告知内容（归档包/批次/命中明细/生成时刻）一经生成不可
       改写、不可删除，仅确认时刻可一次性写入；不改写归档快照、签收记录、
       撤销记录与影响面追查结果。
+17. **标准证书每日校准使用量上限（管理员配置，按 UTC 日原子扣额）**：
+    - **配置模型**：管理员凭本地管理密钥（与交付/停用共用同一把
+      `X-Management-Key` / `DELIVERY_MANAGEMENT_KEY`）对“**被直接引用的
+      上游证书编号 × UTC 日期**”配置非负整数上限
+      （`PUT /api/v1/certificates/{cert_no}/daily-quotas/{day}`，
+      `day=YYYY-MM-DD`）。首次配置返回 `201`，调整既有配置返回 `200`；
+      响应给出 `daily_limit`、实时 `used`（已用次数）、`remaining`（剩余）。
+      缺/错管理密钥 `401 invalid_management_key`，证书不存在
+      `404 cert_not_found`，负数 `422`。**只有存在配置行的“证书×日期”才
+      受控；未配置上限完全沿用原签发规则**（无配置行即无限制，签发事务
+      仅做一次只读短路判断）。
+    - **计数口径**：每张普通证书（`CALIBRATION`）在**真正签发（事务提交）**
+      时，按其 `calibrated_at` 换算 **UTC 后的日历日期**、对其
+      **直接引用**的上游证书（`parent_cert_no`）计**一次**。基准证书登记
+      不计；间接上游（祖父及以上）不重复计；`PASS`/`FAIL` 均计；批内多张
+      相同“上游×UTC 日”的证书**合并计数**。已用次数不单独落表，直接按
+      `certificates` 中满足 `parent_cert_no` 与校准时刻 UTC 日的现存普通
+      证书实时计数，因此**撤销（REVOKED）或级联失效（INVALID）不退还
+      已用次数**，已用次数只增不减。
+    - **调整下限保护**：配置/上调任意非负值都允许；下调（含改为 0）时若
+      当日已签发次数大于新上限，返回 `422 quota_below_usage`（`details`
+      给出 `used`/`daily_limit`/`day`/`cert_no`），本次不生效、原配置
+      保持不变。上限为 0 表示当日完全禁止以该证书为直接上游的签发。
+    - **真正签发时原子扣额**：
+      * **单张签发**（`POST /api/v1/certificates`）与**复核批准**
+        （批准在批准当时同事务真正签发）在校验上游有效性、停用、有效期后
+        执行扣额；已用次数达到上限时返回 `422 daily_quota_exceeded`，
+        `details` 点名 `parent_cert_no`、`day`（UTC）、`daily_limit`、
+        `used` 与本次未签发的 `cert_no`。单张证书不落库；**复核申请保持
+        PENDING**（不产生证书，上调上限或换日后可由复核人再次批准）；
+        驳回不签发、不计数。
+      * **交接批次**（`POST /api/v1/certificate-batches`）按拓扑序逐张
+        校验落库，批内前序插入对后续计数可见：批内多张相同键合并计数，
+        任一普通证书将使该“上游×UTC 日”用量超过上限即整体回滚——
+        **整批不落库**（无批次快照、批内任何证书均不可见），错误详情同样
+        点名上游证书与日期。已存在批次的**幂等重放只返回首次签发结果
+        快照，不重新计数**（无论上限事后是否下调）。
+    - **并发不超额**：限额调整事务先对目标证书行加 `FOR UPDATE` 再写
+      配置；签发事务在签发校验中对其直接上游证书行持锁（单张/复核批准
+      `FOR UPDATE`，批次按拓扑序逐张处理），并对限额行 `FOR UPDATE`
+      复核与计数——调整与同键签发在同一把行锁上**按实际提交次序串行**：
+      调整先提交则随后签发按新上限判定（下调为 0 即全部拒绝），签发先
+      提交则其用量计入、调整端按新用量复核下限（低于已用次数的下调被
+      拒）。任何交错下“已提交的以该上游为直接引用、校准 UTC 日相同的
+      普通证书数”绝不超过当时已提交的上限；理论等待环由既有的死锁检测
+      与整体重试（`409 issuance_busy` / `quota_busy`，调用方可重试）兜底。
+    - **查询**：凭管理密钥
+      `GET /api/v1/certificates/{cert_no}/daily-quotas/{day}` 返回配置与
+      实时已用/剩余；该键未配置上限时 `404 quota_not_found`（`details`
+      仍给出实时已用次数，便于排障），证书不存在 `404 cert_not_found`。
+    - **不影响既有规则**：上限仅作用于“签发是否放行”，不改变证书内容、
+      状态、追溯链、撤销/级联失效、停用、交付归档与覆盖审计；撤销或失效
+      后上限配置依然存在并继续拦截新签发（此时引用会先按既有
+      `reference_not_active` 规则被拒）。
 
 证书状态：`ACTIVE` 生效中 / `REVOKED` 被主动撤销 / `INVALID` 因上游撤销级联失效。
 
@@ -386,6 +448,93 @@ curl -sS -X POST http://localhost:8080/api/v1/certificates \
     "calibrated_at": "2026-04-02T10:00:00+08:00",
     "conclusion": "PASS",
     "parent_cert_no": "CAL-WS-001"
+  }'
+```
+
+### 2B. 设定/调整标准证书每日校准使用量上限（管理员，X-Management-Key）
+
+管理员凭管理密钥为“被直接引用的上游证书编号 × UTC 日期”配置非负每日上限。
+路径中的日期为 **UTC 日历日**（`YYYY-MM-DD`），与普通证书 `calibrated_at`
+换算 UTC 后的日期一一对应；未配置上限的键沿用原签发规则（不受限）。
+
+```bash
+# 为 REF-MASTER-001 在 UTC 日期 2026-03-04 设定上限 2
+curl -sS -X PUT http://localhost:8080/api/v1/certificates/REF-MASTER-001/daily-quotas/2026-03-04 \
+  -H 'Content-Type: application/json' \
+  -H 'X-Management-Key: caltrace-delivery-admin' \
+  -d '{"daily_limit": 2}'
+```
+
+首次配置返回 `201`，调整既有配置返回 `200`，响应给出上限与实时已用/剩余：
+
+```json
+{
+  "cert_no": "REF-MASTER-001",
+  "day": "2026-03-04",
+  "daily_limit": 2,
+  "used": 0,
+  "remaining": 2,
+  "created_at": "2026-10-05T09:00:00Z",
+  "updated_at": "2026-10-05T09:00:00Z"
+}
+```
+
+注意 `calibrated_at` 按 **UTC** 切日：上例的普通证书若传
+`2026-03-05T08:00:00+08:00`（= `2026-03-05T00:00:00Z`）计入 `2026-03-05`，
+而 `2026-03-05T07:59:00+08:00`（= `2026-03-04T23:59:00Z`）仍计入
+`2026-03-04`。
+
+```bash
+# 上调为 3（200）
+curl -sS -X PUT http://localhost:8080/api/v1/certificates/REF-MASTER-001/daily-quotas/2026-03-04 \
+  -H 'Content-Type: application/json' \
+  -H 'X-Management-Key: caltrace-delivery-admin' \
+  -d '{"daily_limit": 3}'
+
+# 查询配置与实时已用次数
+curl -sS http://localhost:8080/api/v1/certificates/REF-MASTER-001/daily-quotas/2026-03-04 \
+  -H 'X-Management-Key: caltrace-delivery-admin'
+```
+
+当日已签发 3 张后再下调到 2（撤销/失效不退还已用次数）返回
+`422 quota_below_usage`，原配置不变；用满后新签发（单张/批准/批次）返回
+`422 daily_quota_exceeded`，批次整批不落库、复核申请保持待审：
+
+```json
+{
+  "error": {
+    "code": "daily_quota_exceeded",
+    "message": "上游标准证书 REF-MASTER-001 在 UTC 日期 2026-03-04 的校准签发已达每日上限 3（已用 3），证书 CAL-X 本次不予签发",
+    "details": {
+      "cert_no": "CAL-X",
+      "parent_cert_no": "REF-MASTER-001",
+      "day": "2026-03-04",
+      "daily_limit": 3,
+      "used": 3
+    }
+  }
+}
+```
+
+交接批次的扣额示例（批内两张相同“上游×UTC 日”合并计数；把 `2` 改成 `3`
+且当日上限仍为 2 时整批 `422`、不落任何证书；同批次键重放返回首次结果、
+不重复计数）：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/certificate-batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batch_key": "HANDOVER-2026-03-05-01",
+    "certificates": [
+      {"cert_no":"CAL-B-01","kind":"CALIBRATION","device_id":"DEV-B1",
+       "valid_from":"2026-03-01T00:00:00Z","valid_to":"2027-03-01T00:00:00Z",
+       "calibrated_at":"2026-03-04T10:00:00Z","conclusion":"PASS",
+       "parent_cert_no":"REF-MASTER-001"},
+      {"cert_no":"CAL-B-02","kind":"CALIBRATION","device_id":"DEV-B2",
+       "valid_from":"2026-03-01T00:00:00Z","valid_to":"2027-03-01T00:00:00Z",
+       "calibrated_at":"2026-03-04T11:00:00Z","conclusion":"PASS",
+       "parent_cert_no":"REF-MASTER-001"}
+    ]
   }'
 ```
 
@@ -1206,7 +1355,7 @@ curl -sS -X POST http://localhost:8080/api/v1/delivery-revocation-notices/1/conf
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
 | 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` / `declaration_not_found` / `archive_not_found` / `invitation_not_found` / `receipt_not_found` / `notice_not_found` | 目标不存在（`receipt_not_found`：归档包存在但尚未定稿；`notice_not_found`：撤销风险告知不存在或不属于该定稿邀请对应的归档包） |
-| 401 | `invalid_management_key` | 创建签收邀请、查询定稿记录，或登记/解除/查询标准证书停用时 `X-Management-Key` 缺失/错误 |
+| 401 | `invalid_management_key` | 创建签收邀请、查询定稿记录，登记/解除/查询标准证书停用，或设定/调整/查询每日校准使用量上限时 `X-Management-Key` 缺失/错误 |
 | 401 | `invalid_identity_key` | 提交复核申请时 `X-Entry-Key`、驳回/批准/查询复核时 `X-Reviewer-Key`（或录入凭据）缺失/无效（两角色凭据不通用） |
 | 403 | `reviewer_must_differ` | 复核人与录入人使用了同一把身份凭据（普通证书签发须双人复核） |
 | 404 | `review_request_not_found` | 按申请号定稿或查询时申请不存在 |
@@ -1222,6 +1371,10 @@ curl -sS -X POST http://localhost:8080/api/v1/delivery-revocation-notices/1/conf
 | 422 | `suspension_reason_required` | 登记停用或解除停用时原因为空或纯空白 |
 | 422 | `reference_suspended` | 签发（单张/批次、含批内引用）引用了停用中证书或其任何下游证书（`details` 给出受阻证书 `blocked_cert_no` 与停用源 `suspension_source`，批次另附 `cert_no`） |
 | 409 | `issuance_busy` / `suspension_busy` | 签发（单张/批次）或停用/解除与并发停用/撤销/签发竞争且死锁重试耗尽（防御性兜底，调用方可重试） |
+| 422 | `daily_quota_exceeded` | 普通证书签发（单张/复核批准/批次）将使“直接上游证书 × calibrated_at 的 UTC 日”用量超过已配置的每日上限（`details` 点名 `parent_cert_no`、`day`、`daily_limit`、`used`、`cert_no`；批次整批不落库、复核申请保持 PENDING） |
+| 422 | `quota_below_usage` | 设定/调整的非负新上限低于该“证书×UTC 日”已签发次数（撤销/失效不退还已用次数），本次调整不生效 |
+| 409 | `quota_busy` | 限额调整与并发签发竞争且死锁重试耗尽（防御性兜底，调用方可重试） |
+| 404 | `quota_not_found` | 查询的“证书×UTC 日”未配置每日上限（`details.used` 仍给出实时已用次数；未配置即沿用原签发规则） |
 | 409 | `cert_duplicate` | 证书编号已存在（含并发重复签发、批次与库内冲突） |
 | 409 | `batch_conflict` | 同一批次键提交了内容不同的签发请求 |
 | 409 | `correction_conflict` | 同一声明编号提交了内容不同的更正请求 |
@@ -1271,6 +1424,7 @@ python3 scripts/coverage_checks.py    # 覆盖审计：计入窗口/撤销与级
 python3 scripts/suspension_checks.py  # 标准证书临时停用：登记/解除/查询/受阻链单张与批次拦截/不改写/提交次序并发
 python3 scripts/review_checks.py      # 普通证书双人复核：凭据/待审不占用/驳回不可再批准/批准按当时规则真正签发/失败仍待审/幂等与并发定稿/契约不变
 python3 scripts/notice_checks.py      # 撤销风险告知：ACCEPT 归档波及生成/同包同批一份/未签收与 REJECT 不生成/查询确认凭据/过期确认/并发次序
+python3 scripts/quota_checks.py       # 标准证书每日用量上限：设定调整/下限保护/UTC 切日/单张批次合并计数整批不落库/复核待审/撤销不退/幂等不重复计数/并发不超额
 ```
 
 覆盖：基准登记、多级签发、无效引用、越界校准时刻、区间重叠（含首尾相接）、
@@ -1351,3 +1505,20 @@ REJECTED 绑定结论/复核人/原因/时刻且不产生证书、驳回后再�
 查询与确认不受影响）、16 组链签收×撤销并发按提交次序判定（先签收则生成
 告知且批次对应，先撤销则 ACCEPT 422 且无定稿无告知），以及既有归档快照/
 定稿记录/撤销批次/影响面追查契约与根索引端点清单不变。
+标准证书每日校准使用量上限的管理密钥校验（缺失/错误 401）、未知证书
+404、负上限与非法日期 422、首次配置 201 与调整 200（含 `created_at`
+不变/`updated_at` 更新）、下调低于当日已用次数 `422 quota_below_usage`
+且原配置不变、未配置日查询 `404 quota_not_found` 且 `details.used` 实时
+给出；单张签发按直接上游与 `calibrated_at` 的 UTC 日计一次（含 UTC 切日
+边界、显式 UTC 偏移、其他 UTC 日不受限、PASS/FAIL 均计、超限额证书不落库）、
+撤销/失效不退还已用次数（撤销后新签发仍超限、上游撤销后先按
+`reference_not_active` 拒绝）；交接批次批内多张相同键合并计数、超限整批
+不落库且无首次快照、恰满上限整批成功、用满后新批次整批不落库、成功批次
+同键重放 200 不重复计数、同键异内容仍 `409 batch_conflict`、仅基准证书
+批次不受限、批内引用链按直接上游（本批/库内）逐键计数并整批拦截；双人
+复核批准在真正签发时扣额、超限 422 且申请保持 PENDING、上调后原申请可
+再次批准、驳回不计数；未配置上限的证书单张与批次完全沿用原签发规则；
+并发签发成功落库数绝不超过上限（未成功者均不落库，既有 `issuance_busy`
+竞争保护不影响该不变量）、并发“下调为 0 × 签发”按提交次序串行
+（成功签发数恰等于下调时已用数，下调后到达的签发无额外成功），以及根
+索引端点清单包含新接口、既有签发/批次/复核接口契约不变。

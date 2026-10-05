@@ -54,9 +54,16 @@ app = FastAPI(
         "同包同批一份，未签收或 REJECT 不生成）；收件人凭定稿邀请编号与一次性密钥"
         "查询、确认告知（密钥过期不影响已签收后的确认，重复确认返回首次确认时间）；"
         "支持按设备审计过去半开区间内的校准覆盖：按时间顺序返回完整、无重叠的"
-        "合规/空窗片段，合规片段列出当时可用的合格普通证书编号。"
+        "合规/空窗片段，合规片段列出当时可用的合格普通证书编号；"
+        "支持标准证书每日校准使用量控制：管理员凭管理密钥为证书编号与 UTC 日期"
+        "设定非负每日上限，成功返回上限与已用次数，已用次数超过新上限则拒绝调整"
+        "（撤销或失效不退还已用次数）；普通证书按 calibrated_at 的 UTC 日期及"
+        "直接引用的上游证书计一次，未配置上限沿用原签发规则；单张签发、交接批次"
+        "（批内多张相同键合并计数）与双人复核批准均在真正签发时原子扣额，超限"
+        "拒绝并指出上游证书与日期，批次整批不落库、复核申请保持待审；并发调整与"
+        "签发按提交次序串行绝不超额，批次幂等重放只返回首次结果、不重复计数。"
     ),
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -95,6 +102,8 @@ def index():
         "endpoints": [
             "POST /api/v1/reference-certificates",
             "POST /api/v1/certificates",
+            "PUT  /api/v1/certificates/{cert_no}/daily-quotas/{day}",
+            "GET  /api/v1/certificates/{cert_no}/daily-quotas/{day}",
             "POST /api/v1/certificate-review-requests",
             "POST /api/v1/certificate-review-requests/{application_no}/decision",
             "GET  /api/v1/certificate-review-requests/{application_no}",

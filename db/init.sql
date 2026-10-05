@@ -274,6 +274,32 @@ ALTER TABLE certificate_review_requests ADD CONSTRAINT cert_review_decision_meta
     );
 
 -- ----------------------------------------------------------------------------
+-- 标准证书每日校准使用量上限表（实验室按“标准证书编号 × UTC 日期”控制
+-- 当日以该证书为【直接上游】的普通证书签发数量）：
+-- 仅当存在某 (cert_no, day) 配置行时该“键”才受限额控制；未配置时沿用原
+-- 签发规则（无行即无限额，签发事务无需等待）。
+-- daily_limit 为非负整数（0 表示当日完全禁止以该证书为直接上游的签发）；
+-- used_count 不落库——已用次数直接按 certificates 中
+-- parent_cert_no = cert_no 且校准时刻的 UTC 日期 = day 的普通证书实时计数
+-- （撤销/失效不退还，天然只增不减）。
+-- 本表允许 UPDATE（管理员上调/下调上限），不设只增触发器；下限校验
+-- （不得低于当日已签发次数）与并发扣额由应用事务在行锁上保证。
+-- ----------------------------------------------------------------------------
+CREATE TABLE cert_daily_quotas (
+    cert_no      TEXT NOT NULL REFERENCES certificates(cert_no),
+    day          DATE NOT NULL,                   -- UTC 日期（calibrated_at 换算 UTC 后的日历日）
+    daily_limit  BIGINT NOT NULL CHECK (daily_limit >= 0),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (cert_no, day)
+);
+
+-- 签发扣额时的实时计数索引：按直接上游 + 校准时刻 UTC 日期。
+-- 表达式必须与计数查询中的 ((calibrated_at AT TIME ZONE 'UTC')::date) 完全一致。
+CREATE INDEX idx_cert_quota_usage
+    ON certificates (parent_cert_no, ((calibrated_at AT TIME ZONE 'UTC')::date));
+
+-- ----------------------------------------------------------------------------
 -- 触发器 1：证书签发内容不可改写
 -- 仅允许 status / revoked_reason / revoked_at 在撤销事务中变化；
 -- 其余业务字段（编号、设备、时间、结论、引用关系等）一律拒绝 UPDATE。

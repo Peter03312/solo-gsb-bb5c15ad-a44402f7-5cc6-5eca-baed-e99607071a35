@@ -3,6 +3,8 @@
 约定：
 - POST   /api/v1/reference-certificates        登记基准设备合格证书（追溯起点）
 - POST   /api/v1/certificates                  签发普通校准证书
+- PUT    /api/v1/certificates/{cert_no}/daily-quotas/{day}  设定/调整标准证书×UTC日期每日校准使用量上限（管理密钥，非负；首次201/调整200）
+- GET    /api/v1/certificates/{cert_no}/daily-quotas/{day}  查询上限与实时已用次数（管理密钥；未配置 404）
 - POST   /api/v1/certificate-review-requests   录入人提交普通证书签发复核申请（X-Entry-Key，申请号幂等）
 - POST   /api/v1/certificate-review-requests/{application_no}/decision  复核人驳回/批准（X-Reviewer-Key，批准同事务真正签发）
 - GET    /api/v1/certificate-review-requests/{application_no}  按申请号查询状态与结果（录入/复核凭据）
@@ -32,7 +34,7 @@
 - GET    /api/v1/revocations/{batch_id}        撤销批次详情（受影响证书及引用链）
 - GET    /api/v1/revocations/{batch_id}/archive-impact  该批撤销对已交付归档凭据的影响面
 """
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
@@ -41,6 +43,8 @@ from psycopg_pool import ConnectionPool
 from . import repository as repo
 from .schemas import (
     BatchIssueRequest,
+    CertificateDailyQuotaOut,
+    CertificateDailyQuotaRequest,
     CertificateIssueRequest,
     CertificateReviewDecisionRequest,
     CertificateReviewSubmitRequest,
@@ -75,6 +79,62 @@ def issue_reference(req: ReferenceIssueRequest, pool: ConnectionPool = Depends(p
 def issue_certificate(req: CertificateIssueRequest, pool: ConnectionPool = Depends(pool_dep)):
     with pool.connection() as conn:
         return repo.issue_certificate(conn, req)
+
+
+@router.put(
+    "/certificates/{cert_no}/daily-quotas/{day}",
+    status_code=201,
+    response_model=CertificateDailyQuotaOut,
+)
+def set_certificate_daily_quota(
+    cert_no: str,
+    day: date,
+    req: CertificateDailyQuotaRequest,
+    response: Response,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="本地配置的管理密钥（与交付/停用管理共用）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """为证书编号与 UTC 日期（YYYY-MM-DD）设定/调整非负每日校准使用量上限。
+
+    成功返回上限与实时已用次数（首次配置 201、调整既有配置 200）；当日已
+    签发次数超过新上限时 422 quota_below_usage（撤销/失效不退还已用次数）。
+    管理密钥缺失/错误 401，证书不存在 404。并发调整与签发按提交次序串行，
+    绝不超额。未配置上限的“证书×日期”沿用原签发规则。
+    """
+    with pool.connection() as conn:
+        body, created = repo.set_certificate_daily_quota(
+            conn, cert_no, day, req.daily_limit, x_management_key
+        )
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.get(
+    "/certificates/{cert_no}/daily-quotas/{day}",
+    response_model=CertificateDailyQuotaOut,
+)
+def get_certificate_daily_quota(
+    cert_no: str,
+    day: date,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="本地配置的管理密钥（与交付/停用管理共用）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """查询某证书×UTC 日期的上限配置与实时已用次数（须凭管理密钥）。
+
+    该键未配置上限时 404 quota_not_found（details 仍给出实时已用次数）；
+    证书不存在 404 cert_not_found。
+    """
+    with pool.connection() as conn:
+        return repo.get_certificate_daily_quota(conn, cert_no, day, x_management_key)
 
 
 @router.post("/certificate-review-requests", status_code=201)

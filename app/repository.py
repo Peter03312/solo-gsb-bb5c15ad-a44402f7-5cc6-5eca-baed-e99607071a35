@@ -343,6 +343,9 @@ def _issue_certificate_in_tx(conn, req) -> dict:
     不产生证书）共用。
     """
     _validate_parent(conn, req.parent_cert_no, req.calibrated_at, req.cert_no)
+    _assert_daily_quota(
+        conn, req.parent_cert_no, req.calibrated_at, req.cert_no,
+    )
     _assert_no_cycle(conn, req.parent_cert_no, req.cert_no)
     _assert_no_overlap(conn, req.device_id, req.valid_from, req.valid_to, req.cert_no)
     cert = _insert_certificate(
@@ -388,6 +391,217 @@ def issue_reference(conn, req) -> dict:
         )
     chain = get_chain(conn, req.cert_no)
     return {"certificate": cert, "chain": chain}
+
+
+# ---------------------------------------------------------------------------
+# 标准证书每日校准使用量上限（按 证书编号 × UTC 日期 配置，凭管理密钥）
+#
+# 计数口径：每张普通证书（CALIBRATION）在真正签发（事务提交）时，按其
+# calibrated_at 的 UTC 日期对其【直接引用】的上游证书计一次；基准证书登记、
+# 未配置上限的键均不受限制。撤销或级联失效不退还已用次数——已用次数即
+# certificates 中满足 parent_cert_no/day 的现存普通证书行，只增不减。
+#
+# 并发正确性：
+#   * 签发事务在 _validate_parent 中已持有直接上游证书行的 FOR UPDATE 锁
+#     （单张/复核批准），批次按拓扑序逐张处理时每张普通证书的直接上游
+#     （库内或本批）同样已持有该行的 FOR UPDATE 锁；
+#   * 配置/调整事务先对目标证书行加 FOR UPDATE 再写限额，因此限额调整与
+#     该证书的并发签发在同一行锁上按提交次序串行化：调整先提交则随后的
+#     签发按新限额判定，签发先提交则其已用次数计入后调整端按新用量复核
+#     （低于已用次数的下调被拒绝）；
+#   * 未配置上限时 cert_daily_quotas 无行，扣额为只读计数短路，原签发
+#     规则与时序完全不变；
+#   * 调整事务与多父批次理论上的等待环由死锁检测终止后整体重试。
+# ---------------------------------------------------------------------------
+
+_QUOTA_COLS = "cert_no, day, daily_limit, created_at, updated_at"
+
+
+def _utc_calibrated_day(value) -> date:
+    """校准时刻换算 UTC 后的日历日期（计数与配置键一律以此为准）。"""
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc).date()
+    return value.astimezone(timezone.utc).date()
+
+
+def _count_daily_used(conn, parent_no: str, day: date) -> int:
+    """已用次数：以 parent_no 为直接上游、校准时刻 UTC 日期为 day 的现存
+    普通证书数量（含本事务已插入、尚未提交的行；撤销/失效不退还）。"""
+    row = conn.execute(
+        """
+        SELECT count(*) AS n
+        FROM certificates
+        WHERE parent_cert_no = %s
+          AND (calibrated_at AT TIME ZONE 'UTC')::date = %s
+        """,
+        (parent_no, day),
+    ).fetchone()
+    return row["n"]
+
+
+def _assert_daily_quota(conn, parent_no: str, calibrated_at, cert_no: str) -> None:
+    """签发扣额：仅当存在 (直接上游, UTC 日) 限额行时校验。
+
+    调用方必须已持有 parent_no 证书行的 FOR UPDATE 行锁（见
+    _validate_parent / 批次拓扑插入），与限额调整事务按提交次序串行化。
+    超限抛出 422 daily_quota_exceeded，调用方事务整体回滚（单张不签发、
+    批次整批不落库、复核申请保持待审）。
+    """
+    day = _utc_calibrated_day(calibrated_at)
+    quota = conn.execute(
+        f"SELECT {_QUOTA_COLS} FROM cert_daily_quotas "
+        "WHERE cert_no = %s AND day = %s FOR UPDATE",
+        (parent_no, day),
+    ).fetchone()
+    if quota is None:
+        # 未配置上限：沿用原签发规则
+        return
+    used = _count_daily_used(conn, parent_no, day)
+    if used >= quota["daily_limit"]:
+        raise ApiError(
+            422,
+            "daily_quota_exceeded",
+            f"上游标准证书 {parent_no} 在 UTC 日期 {day.isoformat()} 的校准签发"
+            f"已达每日上限 {quota['daily_limit']}（已用 {used}），"
+            f"证书 {cert_no} 本次不予签发",
+            details={
+                "cert_no": cert_no,
+                "parent_cert_no": parent_no,
+                "day": day.isoformat(),
+                "daily_limit": quota["daily_limit"],
+                "used": used,
+            },
+        )
+
+
+def _quota_response(conn, row: dict) -> dict:
+    """限额配置行 -> API 视图；used/remaining 实时计算（撤销/失效不退还）。"""
+    used = _count_daily_used(conn, row["cert_no"], row["day"])
+    return {
+        "cert_no": row["cert_no"],
+        "day": row["day"],
+        "daily_limit": row["daily_limit"],
+        "used": used,
+        "remaining": max(row["daily_limit"] - used, 0),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _set_quota_once(conn, cert_no: str, day: date, daily_limit: int):
+    """单次事务尝试设置/调整上限，返回 (视图, 是否首次配置)。
+
+    先锁定目标证书行（与并发签发共用同一把行锁），再 upsert 限额行，
+    随后在同一行锁快照下复核已用次数：当日已签发数超过新上限则回滚拒绝。
+    """
+    with conn.transaction():
+        cert = conn.execute(
+            "SELECT 1 FROM certificates WHERE cert_no = %s FOR UPDATE",
+            (cert_no,),
+        ).fetchone()
+        if cert is None:
+            raise ApiError(404, "cert_not_found", f"证书不存在: {cert_no}")
+        existing = conn.execute(
+            f"SELECT {_QUOTA_COLS} FROM cert_daily_quotas "
+            "WHERE cert_no = %s AND day = %s FOR UPDATE",
+            (cert_no, day),
+        ).fetchone()
+        created = existing is None
+        now = datetime.now(timezone.utc)
+        if created:
+            row = conn.execute(
+                """
+                INSERT INTO cert_daily_quotas (cert_no, day, daily_limit, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING """ + _QUOTA_COLS,
+                (cert_no, day, daily_limit, now, now),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                UPDATE cert_daily_quotas
+                SET daily_limit = %s, updated_at = %s
+                WHERE cert_no = %s AND day = %s
+                RETURNING """ + _QUOTA_COLS,
+                (daily_limit, now, cert_no, day),
+            ).fetchone()
+        used = _count_daily_used(conn, cert_no, day)
+        if used > daily_limit:
+            raise ApiError(
+                422,
+                "quota_below_usage",
+                f"UTC 日期 {day.isoformat()} 已以证书 {cert_no} 为直接上游签发 "
+                f"{used} 张普通证书，新上限 {daily_limit} 低于已用次数："
+                "撤销或失效不退还已用次数，不能下调到已用次数以下",
+                details={
+                    "cert_no": cert_no,
+                    "day": day.isoformat(),
+                    "daily_limit": daily_limit,
+                    "used": used,
+                },
+            )
+        return _quota_response(conn, row), created
+
+
+def set_certificate_daily_quota(
+    conn, cert_no: str, day: date, daily_limit: int, management_key: str | None
+) -> tuple[dict, bool]:
+    """凭管理密钥为证书编号与 UTC 日期设定/调整非负上限，返回 (视图, 是否首次配置)。
+
+    - 管理密钥缺失/错误 401 invalid_management_key；
+    - 证书不存在 404 cert_not_found（可为基准或普通证书，任何证书都可作为
+      被直接引用的上游）；
+    - 当日已签发次数超过新上限时 422 quota_below_usage（撤销/失效不退还，
+      故只能上调至不小于已用次数）；
+    - 成功响应给出上限与实时已用次数（used/remaining）；
+    - 并发调整与同键签发在证书行锁 + 限额行锁上按提交次序串行化，绝不超额；
+      理论等待环由死锁检测终止后整体重试（409 quota_busy）。
+    """
+    _require_management_key(management_key)
+    for attempt in range(3):
+        try:
+            return _set_quota_once(conn, cert_no, day, daily_limit)
+        except ApiError:
+            raise
+        except psycopg.errors.DeadlockDetected:
+            if attempt == 2:
+                raise ApiError(
+                    409,
+                    "quota_busy",
+                    f"证书 {cert_no} 在 {day.isoformat()} 的限额调整与并发签发竞争，"
+                    "重试后仍冲突，请稍后重试",
+                    details={"cert_no": cert_no, "day": day.isoformat()},
+                )
+    raise ApiError(409, "quota_busy", "限额调整失败，请稍后重试")
+
+
+def get_certificate_daily_quota(
+    conn, cert_no: str, day: date, management_key: str | None
+) -> dict:
+    """凭管理密钥查询某证书×UTC 日期的上限配置与实时已用次数。
+
+    管理密钥缺失/错误 401；证书不存在 404 cert_not_found；
+    该键未配置上限 404 quota_not_found（响应仍给出实时已用次数）。
+    """
+    _require_management_key(management_key)
+    if conn.execute(
+        "SELECT 1 FROM certificates WHERE cert_no = %s", (cert_no,)
+    ).fetchone() is None:
+        raise ApiError(404, "cert_not_found", f"证书不存在: {cert_no}")
+    row = conn.execute(
+        f"SELECT {_QUOTA_COLS} FROM cert_daily_quotas WHERE cert_no = %s AND day = %s",
+        (cert_no, day),
+    ).fetchone()
+    if row is None:
+        used = _count_daily_used(conn, cert_no, day)
+        raise ApiError(
+            404,
+            "quota_not_found",
+            f"证书 {cert_no} 在 UTC 日期 {day.isoformat()} 未配置每日上限"
+            "（当前沿用原签发规则，无上限）",
+            details={"cert_no": cert_no, "day": day.isoformat(), "used": used},
+        )
+    return _quota_response(conn, row)
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +771,12 @@ def _insert_batch_items(conn, ordered: list) -> None:
         try:
             if it.kind == "CALIBRATION":
                 _validate_parent(conn, it.parent_cert_no, it.calibrated_at, it.cert_no)
+                # 每张普通证书按 (直接上游, calibrated_at 的 UTC 日) 计一次；
+                # 批内多张相同键的证书在此逐张扣额并合并计数（同事务前序插入
+                # 对后续计数可见），超限即整批回滚、不落任何证书。
+                _assert_daily_quota(
+                    conn, it.parent_cert_no, it.calibrated_at, it.cert_no
+                )
             _assert_no_overlap(
                 conn, it.device_id, it.valid_from, it.valid_to, it.cert_no
             )

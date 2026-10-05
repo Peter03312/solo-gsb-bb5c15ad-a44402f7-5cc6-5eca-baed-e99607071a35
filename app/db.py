@@ -134,6 +134,18 @@ ALTER TABLE certificate_review_requests ADD CONSTRAINT cert_review_decision_meta
     );
 """,
     """
+CREATE TABLE IF NOT EXISTS cert_daily_quotas (
+    cert_no      TEXT NOT NULL REFERENCES certificates(cert_no),
+    day          DATE NOT NULL,
+    daily_limit  BIGINT NOT NULL CHECK (daily_limit >= 0),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (cert_no, day)
+);
+CREATE INDEX IF NOT EXISTS idx_cert_quota_usage
+    ON certificates (parent_cert_no, ((calibrated_at AT TIME ZONE 'UTC')::date));
+""",
+    """
 CREATE OR REPLACE FUNCTION cert_review_decide_once() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'DELETE' THEN

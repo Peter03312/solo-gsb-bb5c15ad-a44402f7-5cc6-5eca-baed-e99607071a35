@@ -4,7 +4,7 @@
 不传时区时按 UTC 处理。
 有效期统一按半开区间 [valid_from, valid_to) 解释，首尾相接不算重叠。
 """
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -485,6 +485,32 @@ class CertificateSuspensionOut(BaseModel):
     history: list[SuspensionEventOut] = Field(
         ..., description="历次停用/解除事件，按登记时间（suspension_id）升序；每次停用随后可能有一次解除"
     )
+
+
+class CertificateDailyQuotaRequest(BaseModel):
+    """为标准证书编号与 UTC 日期设定/调整非负每日上限（管理密钥经 X-Management-Key 头校验）。
+
+    当日已签发次数超过新上限时拒绝（撤销/失效不退还已用次数）；
+    成功返回上限与已用次数。未配置上限的“证书×日期”沿用原签发规则。
+    """
+    daily_limit: int = Field(
+        ..., ge=0,
+        description="非负每日上限：当日以该证书为【直接上游】的普通证书最大签发数；0=当日禁止",
+    )
+
+
+class CertificateDailyQuotaOut(BaseModel):
+    """标准证书每日校准使用量视图：配置上限 + 实时已用/剩余次数。"""
+    cert_no: str = Field(..., description="被引用的上游证书编号")
+    day: date = Field(..., description="UTC 日期（YYYY-MM-DD，按 calibrated_at 换算 UTC 计）")
+    daily_limit: int = Field(..., description="当前配置的非负每日上限")
+    used: int = Field(
+        ...,
+        description="已用次数：当日以该证书为直接上游的现存普通证书数（撤销/失效不退还）",
+    )
+    remaining: int = Field(..., description="剩余可签发次数（max(daily_limit-used, 0)）")
+    created_at: datetime = Field(..., description="首次配置时刻")
+    updated_at: datetime = Field(..., description="最近一次调整时刻")
 
 
 class ErrorBody(BaseModel):
