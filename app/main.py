@@ -54,9 +54,14 @@ app = FastAPI(
         "同包同批一份，未签收或 REJECT 不生成）；收件人凭定稿邀请编号与一次性密钥"
         "查询、确认告知（密钥过期不影响已签收后的确认，重复确认返回首次确认时间）；"
         "支持按设备审计过去半开区间内的校准覆盖：按时间顺序返回完整、无重叠的"
-        "合规/空窗片段，合规片段列出当时可用的合格普通证书编号。"
+        "合规/空窗片段，合规片段列出当时可用的合格普通证书编号；"
+        "支持按上游证书 × UTC 日期控制每日校准使用量：管理员凭管理密钥设定/调整"
+        "非负上限（已签发次数超过新上限则拒绝调整），普通证书在真正签发时按 "
+        "calibrated_at 的 UTC 日期与直接引用的上游证书原子核额（单张/批次/复核"
+        "批准一致，批内合并计数），超限拒绝签发并指出上游证书与日期，"
+        "撤销/失效不退还已用次数，并发调整与签发不超额。"
     ),
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -111,6 +116,8 @@ def index():
             "POST /api/v1/certificates/{cert_no}/suspensions",
             "POST /api/v1/certificates/{cert_no}/suspension-lift",
             "GET  /api/v1/certificates/{cert_no}/suspensions",
+            "POST /api/v1/daily-usage-limits",
+            "GET  /api/v1/daily-usage-limits/{cert_no}/{usage_date}",
             "POST /api/v1/delivery-archives",
             "GET  /api/v1/delivery-archives/{archive_no}",
             "POST /api/v1/delivery-invitations",

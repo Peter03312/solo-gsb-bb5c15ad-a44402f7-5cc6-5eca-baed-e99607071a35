@@ -345,6 +345,14 @@ def _issue_certificate_in_tx(conn, req) -> dict:
     _validate_parent(conn, req.parent_cert_no, req.calibrated_at, req.cert_no)
     _assert_no_cycle(conn, req.parent_cert_no, req.cert_no)
     _assert_no_overlap(conn, req.device_id, req.valid_from, req.valid_to, req.cert_no)
+    # 每日使用量核额：按“直接上游证书 × calibrated_at 的 UTC 日期”计一次，
+    # 未配置上限的键不限次数；超限则整事务回滚（不产生证书、已用次数不泄漏）
+    day = _usage_date_of(req.calibrated_at)
+    _consume_daily_quota(
+        conn,
+        {(req.parent_cert_no, day): 1},
+        {(req.parent_cert_no, day): req.cert_no},
+    )
     cert = _insert_certificate(
         conn, kind="CALIBRATION", conclusion=req.conclusion,
         parent_no=req.parent_cert_no, req=req,
@@ -388,6 +396,189 @@ def issue_reference(conn, req) -> dict:
         )
     chain = get_chain(conn, req.cert_no)
     return {"certificate": cert, "chain": chain}
+
+
+# ---------------------------------------------------------------------------
+# 每日校准使用量上限（按上游证书 × UTC 日期）：普通证书在真正签发时按其
+# calibrated_at 的 UTC 日期与直接引用的上游证书计一次（基准证书无上游、不计数）；
+# 未配置上限的键沿用原签发规则（不限次数）。已用次数只增不减：证书撤销/级联
+# 失效不退还（数据库触发器强制单调）。每个键的计数行在签发与限额调整事务中
+# 均先 FOR UPDATE 锁定，并发调整与并发签发在同一行锁上串行化，不会超额。
+# ---------------------------------------------------------------------------
+
+def _usage_date_of(calibrated_at: datetime) -> date:
+    """校准时刻对应的 UTC 日期（每日使用量计数键；无时区按 UTC 处理）。"""
+    if calibrated_at.tzinfo is None or calibrated_at.utcoffset() is None:
+        calibrated_at = calibrated_at.replace(tzinfo=timezone.utc)
+    return calibrated_at.astimezone(timezone.utc).date()
+
+
+def _consume_daily_quota(conn, usage: dict, representatives: dict) -> None:
+    """对若干 (上游证书编号, UTC 日期) 键原子核额：每个键先锁定计数行（不存在
+    则以 0 创建），再按当日上限校验“已用 + 本次 ≤ 上限”，最后累加已用次数。
+
+    - 计数行锁与限额调整事务在同一把行锁上串行化：并发调整与并发签发不会超额；
+    - 未配置上限的键仅累加已用次数，不限制签发（沿用原签发规则）；
+    - 超限抛出 422 daily_usage_limit_exceeded，details 指出上游证书
+      （parent_cert_no）与 UTC 日期（usage_date），批次另附批内证书编号
+      （cert_no）；整个签发事务回滚——单张/复核批准不产生证书、批次整批
+      不落库，已用次数不泄漏；
+    - 多个键按 (证书编号, 日期) 字典序依次加锁，避免键间等待环。
+    """
+    for cert_no, day in sorted(usage):
+        need = usage[(cert_no, day)]
+        conn.execute(
+            """
+            INSERT INTO daily_usage_counters (cert_no, usage_date, used)
+            VALUES (%s, %s, 0)
+            ON CONFLICT (cert_no, usage_date) DO NOTHING
+            """,
+            (cert_no, day),
+        )
+        used = conn.execute(
+            "SELECT used FROM daily_usage_counters "
+            "WHERE cert_no = %s AND usage_date = %s FOR UPDATE",
+            (cert_no, day),
+        ).fetchone()["used"]
+        limit_row = conn.execute(
+            "SELECT daily_limit FROM daily_usage_limits "
+            "WHERE cert_no = %s AND usage_date = %s",
+            (cert_no, day),
+        ).fetchone()
+        if limit_row is not None and used + need > limit_row["daily_limit"]:
+            new_cert_no = representatives.get((cert_no, day))
+            details = {
+                "parent_cert_no": cert_no,
+                "usage_date": day.isoformat(),
+                "limit": limit_row["daily_limit"],
+                "used": used,
+                "requested": need,
+            }
+            if new_cert_no is not None:
+                details["cert_no"] = new_cert_no
+            raise ApiError(
+                422,
+                "daily_usage_limit_exceeded",
+                f"上游证书 {cert_no} 在 {day.isoformat()}（UTC）的每日校准使用量"
+                f"已达上限：已用 {used} 次、上限 {limit_row['daily_limit']} 次，"
+                f"本次签发需计 {need} 次，超出上限，本次签发被拒绝",
+                details=details,
+            )
+        conn.execute(
+            "UPDATE daily_usage_counters SET used = used + %s "
+            "WHERE cert_no = %s AND usage_date = %s",
+            (need, cert_no, day),
+        )
+
+
+def _batch_usage_map(items) -> tuple[dict, dict]:
+    """汇总批内普通证书对各 (上游证书, UTC 日期) 键的计数（批内多张合并计数），
+    以及每个键在请求列表中的首个证书编号（超限错误 details.cert_no 定位用）。
+    """
+    usage: dict[tuple[str, date], int] = {}
+    representatives: dict[tuple[str, date], str] = {}
+    for it in items:
+        if it.kind != "CALIBRATION":
+            continue
+        key = (it.parent_cert_no, _usage_date_of(it.calibrated_at))
+        usage[key] = usage.get(key, 0) + 1
+        representatives.setdefault(key, it.cert_no)
+    return usage, representatives
+
+
+def _daily_usage_out(cert_no: str, day: date, limit_row: dict | None, used: int) -> dict:
+    return {
+        "cert_no": cert_no,
+        "usage_date": day,
+        "limit": limit_row["daily_limit"] if limit_row is not None else None,
+        "used": used,
+        "updated_at": limit_row["updated_at"] if limit_row is not None else None,
+    }
+
+
+def set_daily_usage_limit(conn, req, management_key: str | None) -> dict:
+    """设定/调整某上游证书在一个 UTC 日期的每日校准使用量上限（管理密钥）。
+
+    - 管理密钥缺失/错误 → 401 invalid_management_key；证书不存在 → 404 cert_not_found；
+      上限必须为非负整数（结构校验 422）；同一 (证书编号, UTC 日期) 重复提交即调整；
+    - 该日已签发次数超过新上限 → 409 usage_limit_below_used（不调整）；
+    - 与并发签发在同一计数行锁上串行化：调整读取的已用次数包含全部已提交签发，
+      未提交的并发签发要么先于本调整提交（计入已用），要么被阻塞到本调整提交
+      之后（按新上限核额）——并发调整与并发签发不会超额。
+    """
+    _require_management_key(management_key)
+    with conn.transaction():
+        cert = conn.execute(
+            "SELECT cert_no FROM certificates WHERE cert_no = %s", (req.cert_no,)
+        ).fetchone()
+        if cert is None:
+            raise ApiError(404, "cert_not_found", f"证书不存在: {req.cert_no}")
+        conn.execute(
+            """
+            INSERT INTO daily_usage_counters (cert_no, usage_date, used)
+            VALUES (%s, %s, 0)
+            ON CONFLICT (cert_no, usage_date) DO NOTHING
+            """,
+            (req.cert_no, req.usage_date),
+        )
+        used = conn.execute(
+            "SELECT used FROM daily_usage_counters "
+            "WHERE cert_no = %s AND usage_date = %s FOR UPDATE",
+            (req.cert_no, req.usage_date),
+        ).fetchone()["used"]
+        if used > req.limit:
+            raise ApiError(
+                409,
+                "usage_limit_below_used",
+                f"证书 {req.cert_no} 在 {req.usage_date.isoformat()}（UTC）当日已签发 "
+                f"{used} 次，超过拟设定的每日上限 {req.limit}，拒绝调整；"
+                "已用次数不因证书撤销/失效退还",
+                details={
+                    "cert_no": req.cert_no,
+                    "usage_date": req.usage_date.isoformat(),
+                    "used": used,
+                    "requested_limit": req.limit,
+                },
+            )
+        limit_row = conn.execute(
+            """
+            INSERT INTO daily_usage_limits (cert_no, usage_date, daily_limit)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (cert_no, usage_date)
+            DO UPDATE SET daily_limit = EXCLUDED.daily_limit, updated_at = now()
+            RETURNING cert_no, usage_date, daily_limit, updated_at
+            """,
+            (req.cert_no, req.usage_date, req.limit),
+        ).fetchone()
+    return _daily_usage_out(req.cert_no, req.usage_date, limit_row, used)
+
+
+def get_daily_usage_limit(
+    conn, cert_no: str, usage_date: date, management_key: str | None
+) -> dict:
+    """查询某 (证书编号, UTC 日期) 键的每日使用量上限与已用次数（管理密钥）。
+
+    证书不存在 → 404 cert_not_found；未配置上限时 limit 为 null（签发沿用
+    原规则，不限次数），used 为当日已签发计数（无记录时为 0）。
+    """
+    _require_management_key(management_key)
+    cert = conn.execute(
+        "SELECT cert_no FROM certificates WHERE cert_no = %s", (cert_no,)
+    ).fetchone()
+    if cert is None:
+        raise ApiError(404, "cert_not_found", f"证书不存在: {cert_no}")
+    counter = conn.execute(
+        "SELECT used FROM daily_usage_counters WHERE cert_no = %s AND usage_date = %s",
+        (cert_no, usage_date),
+    ).fetchone()
+    limit_row = conn.execute(
+        "SELECT daily_limit, updated_at FROM daily_usage_limits "
+        "WHERE cert_no = %s AND usage_date = %s",
+        (cert_no, usage_date),
+    ).fetchone()
+    return _daily_usage_out(
+        cert_no, usage_date, limit_row, counter["used"] if counter else 0
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +877,12 @@ def _issue_batch_once(conn, req, req_hash: str, request_doc: dict) -> tuple[dict
             return _replay_or_conflict(existing, req.batch_key, req_hash), False
         ordered = _validate_batch(conn, req)
         _insert_batch_items(conn, ordered)
+        # 每日使用量核额：批内多张命中同一 (上游证书, UTC 日期) 键合并计数、
+        # 一次性核额（在批内证书落库后执行，计数行可外键引用批内上游证书）；
+        # 超限则整批回滚——批内证书与批次快照均不落库，已用次数不泄漏
+        usage, representatives = _batch_usage_map(req.certificates)
+        if usage:
+            _consume_daily_quota(conn, usage, representatives)
         issued_at = datetime.now(timezone.utc)
         response = _build_batch_response(conn, req, issued_at)
         conn.execute(

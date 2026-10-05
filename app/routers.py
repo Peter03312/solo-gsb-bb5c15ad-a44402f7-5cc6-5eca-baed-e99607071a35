@@ -19,6 +19,8 @@
 - POST   /api/v1/certificates/{cert_no}/suspensions      登记标准证书临时停用（管理密钥，待复核）
 - POST   /api/v1/certificates/{cert_no}/suspension-lift  复核后解除临时停用（管理密钥）
 - GET    /api/v1/certificates/{cert_no}/suspensions      查询当前停用状态及历次停用/解除（管理密钥）
+- POST   /api/v1/daily-usage-limits                设定/调整每日校准使用量上限（管理密钥，按上游证书×UTC日期）
+- GET    /api/v1/daily-usage-limits/{cert_no}/{usage_date}  查询每日上限与已用次数（管理密钥）
 - POST   /api/v1/delivery-archives             创建客户交付归档包（冻结可交付凭据，编号幂等）
 - GET    /api/v1/delivery-archives/{archive_no}    按归档包编号查询创建时刻快照
 - POST   /api/v1/delivery-invitations          交付方创建签收邀请（管理密钥，返回仅展示一次的随机密钥）
@@ -32,7 +34,7 @@
 - GET    /api/v1/revocations/{batch_id}        撤销批次详情（受影响证书及引用链）
 - GET    /api/v1/revocations/{batch_id}/archive-impact  该批撤销对已交付归档凭据的影响面
 """
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
@@ -46,6 +48,8 @@ from .schemas import (
     CertificateReviewSubmitRequest,
     CertificateSuspensionRequest,
     CorrectionDeclarationRequest,
+    DailyUsageLimitOut,
+    DailyUsageLimitSetRequest,
     DeliveryArchiveRequest,
     DeliveryInvitationRequest,
     DeliveryInvitationResponse,
@@ -275,6 +279,48 @@ def get_certificate_suspension(
     """查询当前停用状态及历次停用、解除的时间和原因（须凭管理密钥）。"""
     with pool.connection() as conn:
         return repo.get_certificate_suspension(conn, cert_no, x_management_key)
+
+
+@router.post("/daily-usage-limits", status_code=200, response_model=DailyUsageLimitOut)
+def set_daily_usage_limit(
+    req: DailyUsageLimitSetRequest,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="本地配置的管理密钥（与交付管理共用）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """设定或调整某上游证书在一个 UTC 日期的每日校准使用量上限（非负整数）。
+
+    成功返回该键当前上限与已用次数；该日已签发次数超过新上限时拒绝调整
+    （409 usage_limit_below_used）。普通证书在真正签发时按 calibrated_at 的
+    UTC 日期与直接引用的上游证书计一次；未配置上限的键不限次数；
+    撤销/失效不退还已用次数。证书不存在 404 cert_not_found、
+    管理密钥缺失/错误 401 invalid_management_key。
+    """
+    with pool.connection() as conn:
+        return repo.set_daily_usage_limit(conn, req, x_management_key)
+
+
+@router.get("/daily-usage-limits/{cert_no}/{usage_date}", response_model=DailyUsageLimitOut)
+def get_daily_usage_limit(
+    cert_no: str,
+    usage_date: date,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="本地配置的管理密钥（与交付管理共用）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """查询某 (证书编号, UTC 日期) 键的每日使用量上限与已用次数（须凭管理密钥）。
+
+    未配置上限时 limit 为 null（签发沿用原规则，不限次数），used 为当日
+    已签发计数（撤销/失效不退还）。证书不存在 404 cert_not_found。
+    """
+    with pool.connection() as conn:
+        return repo.get_daily_usage_limit(conn, cert_no, usage_date, x_management_key)
 
 
 @router.post("/delivery-archives", status_code=201)

@@ -264,6 +264,111 @@ CREATE OR REPLACE TRIGGER trg_delivery_revocation_notices_confirm_once
     BEFORE UPDATE OR DELETE ON delivery_revocation_notices
     FOR EACH ROW EXECUTE FUNCTION delivery_revocation_notices_confirm_once();
 """,
+    """
+CREATE TABLE IF NOT EXISTS daily_usage_counters (
+    cert_no    TEXT NOT NULL REFERENCES certificates(cert_no),
+    usage_date DATE NOT NULL,
+    used       BIGINT NOT NULL CHECK (used >= 0),
+    PRIMARY KEY (cert_no, usage_date)
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS daily_usage_limits (
+    cert_no     TEXT NOT NULL REFERENCES certificates(cert_no),
+    usage_date  DATE NOT NULL,
+    daily_limit BIGINT NOT NULL CHECK (daily_limit >= 0),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (cert_no, usage_date)
+);
+""",
+    """
+CREATE OR REPLACE FUNCTION daily_usage_counters_monotonic() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'daily_usage_counters is append-only: % %', OLD.cert_no, OLD.usage_date
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF NEW.cert_no IS DISTINCT FROM OLD.cert_no
+       OR NEW.usage_date IS DISTINCT FROM OLD.usage_date
+       OR NEW.used < OLD.used
+    THEN
+        RAISE EXCEPTION 'daily usage counter (% on %) can only increase',
+            OLD.cert_no, OLD.usage_date
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_daily_usage_counters_monotonic
+    BEFORE UPDATE OR DELETE ON daily_usage_counters
+    FOR EACH ROW EXECUTE FUNCTION daily_usage_counters_monotonic();
+""",
+    """
+CREATE OR REPLACE FUNCTION daily_usage_limits_key_immutable() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'daily_usage_limits cannot be deleted: % %', OLD.cert_no, OLD.usage_date
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF NEW.cert_no IS DISTINCT FROM OLD.cert_no
+       OR NEW.usage_date IS DISTINCT FROM OLD.usage_date
+    THEN
+        RAISE EXCEPTION 'daily usage limit key is immutable: % %', OLD.cert_no, OLD.usage_date
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_daily_usage_limits_key_immutable
+    BEFORE UPDATE OR DELETE ON daily_usage_limits
+    FOR EACH ROW EXECUTE FUNCTION daily_usage_limits_key_immutable();
+""",
+    """
+CREATE OR REPLACE FUNCTION daily_usage_within_limit() RETURNS trigger AS $$
+DECLARE
+    lim BIGINT;
+BEGIN
+    SELECT daily_limit INTO lim FROM daily_usage_limits
+    WHERE cert_no = NEW.cert_no AND usage_date = NEW.usage_date;
+    IF lim IS NOT NULL AND NEW.used > lim THEN
+        RAISE EXCEPTION 'daily usage % exceeds limit % for % on %',
+            NEW.used, lim, NEW.cert_no, NEW.usage_date
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_daily_usage_counters_within_limit
+    BEFORE INSERT OR UPDATE OF used ON daily_usage_counters
+    FOR EACH ROW EXECUTE FUNCTION daily_usage_within_limit();
+""",
+    """
+CREATE OR REPLACE FUNCTION daily_usage_limit_not_below_used() RETURNS trigger AS $$
+DECLARE
+    u BIGINT;
+BEGIN
+    SELECT used INTO u FROM daily_usage_counters
+    WHERE cert_no = NEW.cert_no AND usage_date = NEW.usage_date;
+    IF u IS NOT NULL AND u > NEW.daily_limit THEN
+        RAISE EXCEPTION 'daily usage limit % is below already used % for % on %',
+            NEW.daily_limit, u, NEW.cert_no, NEW.usage_date
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_daily_usage_limits_not_below_used
+    BEFORE INSERT OR UPDATE OF daily_limit ON daily_usage_limits
+    FOR EACH ROW EXECUTE FUNCTION daily_usage_limit_not_below_used();
+""",
 )
 
 
